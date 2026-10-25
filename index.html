@@ -346,7 +346,7 @@
   <header>
     <div>
       <h1>Panel de Campo</h1>
-      <div class="subtitle">Conectado a Firebase — proyectos-campos · v2.4</div>
+      <div class="subtitle">Conectado a Firebase — proyectos-campos · v2.5</div>
     </div>
     <div style="display:flex; flex-direction:column; align-items:flex-end; gap:6px;">
       <div class="live-tag" id="espStatusTag"><span class="dot" id="espStatusDot"></span><span id="espStatusTexto">ESP32: consultando…</span></div>
@@ -662,9 +662,15 @@ async function firebaseSignIn(){
   tokenExpiraEn = Date.now() + (parseInt(data.expiresIn, 10) - 300) * 1000;
 }
 
+let authEnCurso = null;
 async function ensureAuth(){
   if (!idToken || Date.now() >= tokenExpiraEn) {
-    await firebaseSignIn();
+    // Si ya hay un login en marcha, todos esperan ese mismo (evita crear varios usuarios anónimos
+    // cuando la config y los eventos arrancan a la vez).
+    if (!authEnCurso) {
+      authEnCurso = firebaseSignIn().finally(() => { authEnCurso = null; });
+    }
+    await authEnCurso;
   }
 }
 
@@ -781,23 +787,76 @@ function render(){
   `;
 }
 
+// ==== Caché local ====
+// Guarda la última carga en el dispositivo. Al abrir la app se muestra enseguida lo último que se vio
+// (marcado como "guardado") y en paralelo se actualiza desde la nube. Si el almacenamiento no está
+// disponible, la app funciona igual, solo sin el efecto instantáneo.
+const CLAVE_CACHE = 'panel_campo_cache_v1';
+
+function guardarCache(){
+  try {
+    localStorage.setItem(CLAVE_CACHE, JSON.stringify({
+      ts: Date.now(), eventosCrudos, hasRealesPorLote, movimientosStock, loteActual, config
+    }));
+  } catch(e){ /* sin almacenamiento: se ignora */ }
+}
+
+function restaurarCache(){
+  try {
+    const raw = localStorage.getItem(CLAVE_CACHE);
+    if (!raw) return false;
+    const c = JSON.parse(raw);
+    if (!c || !Array.isArray(c.eventosCrudos)) return false;
+    eventosCrudos = c.eventosCrudos;
+    hasRealesPorLote = c.hasRealesPorLote || {};
+    movimientosStock = c.movimientosStock || [];
+    if (c.loteActual) {
+      loteActual = c.loteActual;
+      document.getElementById('loteActualDisplay').textContent = loteActual;
+    }
+    if (c.config) {
+      config = c.config;
+      dosisSemillaInput.value = config.dosisSemilla || '';
+      dosisFertiInput.value = config.dosisFerti || '';
+    }
+    render();
+    renderEventos();
+    renderStock();
+    renderMovimientos();
+    const hace = Math.max(1, Math.round((Date.now() - c.ts) / 60000));
+    setStatus('Mostrando datos guardados (hace ' + hace + ' min). Actualizando desde la nube…');
+    return true;
+  } catch(e){
+    return false;
+  }
+}
+
+// Lee una ruta de Firebase sin que una falla suelta tire abajo todo lo demás
+async function leerRuta(url){
+  const res = await fetch(conAuth(url + '.json'));
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res.json();
+}
+
 async function cargarEventos(){
   try {
     await ensureAuth();
-    const [resEventos, resHasReales, resMovStock, resLote, resEstadoEsp, resPuertas] = await Promise.all([
-      fetch(conAuth(FIREBASE_BASE + '.json')),
-      fetch(conAuth(FIREBASE_HAS_REALES + '.json')),
-      fetch(conAuth(FIREBASE_MOVIMIENTOS_STOCK + '.json')),
-      fetch(conAuth(FIREBASE_LOTE_ACTUAL + '.json')),
-      fetch(conAuth(FIREBASE_ESTADO_ESP + '.json')),
-      fetch(conAuth(FIREBASE_ESTADO_PUERTAS + '.json'))
+    // Los eventos son lo importante: si fallan, se informa el error. El resto (estado del ESP,
+    // compuertas, etc.) se carga igual aunque alguno falle.
+    const [rEventos, rHas, rMov, rLote, rEstado, rPuertas] = await Promise.allSettled([
+      leerRuta(FIREBASE_BASE),
+      leerRuta(FIREBASE_HAS_REALES),
+      leerRuta(FIREBASE_MOVIMIENTOS_STOCK),
+      leerRuta(FIREBASE_LOTE_ACTUAL),
+      leerRuta(FIREBASE_ESTADO_ESP),
+      leerRuta(FIREBASE_ESTADO_PUERTAS)
     ]);
-    if (!resEventos.ok) throw new Error('HTTP ' + resEventos.status);
-    const data = await resEventos.json();
+    if (rEventos.status === 'rejected') throw rEventos.reason;
+    const data = rEventos.value;
     eventosCrudos = data ? Object.entries(data).map(([id, val]) => ({ id, ...val })) : [];
 
-    if (resHasReales.ok) {
-      const dataHas = await resHasReales.json();
+    if (rHas.status === 'fulfilled') {
+      const dataHas = rHas.value;
       hasRealesPorLote = {};
       if (dataHas) {
         Object.keys(dataHas).forEach(loteCodificado => {
@@ -806,29 +865,20 @@ async function cargarEventos(){
       }
     }
 
-    if (resMovStock.ok) {
-      const dataMov = await resMovStock.json();
+    if (rMov.status === 'fulfilled') {
+      const dataMov = rMov.value;
       movimientosStock = dataMov ? Object.entries(dataMov).map(([id, val]) => ({ id, ...val })) : [];
     }
 
-    if (resLote.ok) {
-      const dataLote = await resLote.json();
-      if (dataLote) {
-        loteActual = dataLote;
-        document.getElementById('loteActualDisplay').textContent = loteActual;
-      }
+    if (rLote.status === 'fulfilled' && rLote.value) {
+      loteActual = rLote.value;
+      document.getElementById('loteActualDisplay').textContent = loteActual;
     }
 
-    if (resEstadoEsp.ok) {
-      const dataEstado = await resEstadoEsp.json();
-      renderEstadoEsp(dataEstado);
-    }
+    if (rEstado.status === 'fulfilled') renderEstadoEsp(rEstado.value);
+    if (rPuertas.status === 'fulfilled') renderEstadoPuertas(rPuertas.value);
 
-    if (resPuertas.ok) {
-      const dataPuertas = await resPuertas.json();
-      renderEstadoPuertas(dataPuertas);
-    }
-
+    guardarCache();
     setStatus('Actualizado ✓ (' + eventosCrudos.length + ' eventos en la nube)');
   } catch(e){
     setStatus('No se pudo conectar con Firebase: ' + e.message, true);
@@ -1461,10 +1511,12 @@ async function cargarConfigLocal(){
       if (data) config = data;
     }
   } catch(e){
-    config = { dosisSemilla: 0, dosisFerti: 0 };
+    // Si falla, se conserva lo que ya había (por ejemplo lo guardado en el dispositivo)
   }
   dosisSemillaInput.value = config.dosisSemilla || '';
   dosisFertiInput.value = config.dosisFerti || '';
+  // Como ahora corre en paralelo con la carga de eventos, vuelve a calcular las hectáreas con la dosis recién leída
+  render();
 }
 
 async function guardarConfigLocal(){
@@ -1554,10 +1606,22 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 function hayEdicionesSinGuardar(){
   return !!eventsTbody.querySelector('.save:not(:disabled)') || !!stockTbody.querySelector('.save:not(:disabled)');
 }
-cargarConfigLocal().then(cargarEventos);
+// Arranque: primero muestra al instante lo último guardado en el dispositivo, y en paralelo
+// (no una cosa después de la otra) trae la config y los datos frescos desde la nube.
+restaurarCache();
+cargarConfigLocal();
+cargarEventos();
 setInterval(() => {
   if (!hayEdicionesSinGuardar()) cargarEventos();
 }, 15000);
+
+// Al volver a la app (desde otra app, con la pantalla apagada o tras recuperar internet) refresca
+// enseguida, sin esperar al próximo ciclo de 15 s, que el celu suele frenar en segundo plano.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && !hayEdicionesSinGuardar()) cargarEventos();
+});
+window.addEventListener('online', () => { if (!hayEdicionesSinGuardar()) cargarEventos(); });
+window.addEventListener('pageshow', (e) => { if (e.persisted && !hayEdicionesSinGuardar()) cargarEventos(); });
 </script>
 </body>
 </html>
